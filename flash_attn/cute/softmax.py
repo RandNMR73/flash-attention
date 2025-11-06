@@ -192,11 +192,12 @@ class SoftmaxSm100(Softmax):
             row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
             acc_scale_ = (row_max_old - row_max_safe) * self.scale_log2
             acc_scale = utils.exp2f(acc_scale_)
-            if cutlass.const_expr(self.rescale_threshold > 0.0):
-                if acc_scale_ >= -self.rescale_threshold:
-                    row_max_new = row_max_old
-                    row_max_safe = row_max_old
-                    acc_scale = 1.0
+            # commented out logic
+            # if cutlass.const_expr(self.rescale_threshold > 0.0):
+            #     if acc_scale_ >= -self.rescale_threshold:
+            #         row_max_new = row_max_old
+            #         row_max_safe = row_max_old
+            #         acc_scale = 1.0
         self.row_max[0] = row_max_new
         return row_max_safe, acc_scale
 
@@ -251,16 +252,19 @@ class SoftmaxSm100(Softmax):
                     acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
                     acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
                 else:
-                    if cutlass.const_expr(
-                        k % e2e_freq < e2e_freq - e2e_res or j >= frg_cnt - e2e_frg_limit
-                    ):
-                        acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
-                        acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
-                    else:
-                        # acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.e2e_asm2(acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j])
-                        acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
-                            acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
-                        )
+                    # commented out logic
+                    # if cutlass.const_expr(
+                    #     k % e2e_freq < e2e_freq - e2e_res or j >= frg_cnt - e2e_frg_limit
+                    # ):
+                    #     acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
+                    #     acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
+                    # else:
+                    #     # acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.e2e_asm2(acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j])
+                    #     acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
+                    #         acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
+                    #     )
+                    acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
+                    acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
             acc_S_row_converted_frg[None, j].store(
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
             )

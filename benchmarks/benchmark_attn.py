@@ -38,6 +38,18 @@ if torch.cuda.get_device_capability()[0] != 9:
 
 flash_attn_func = None
 
+# Import FMHA kernel
+try:
+    import cutlass
+    import cutlass.cute as cute
+    import cutlass.torch as cutlass_torch
+    from cutlass.cute.runtime import from_dlpack
+    from cutlass.cute.typing import Int32, Float32
+    from flash_attn.cute.fmha import BlackwellFusedMultiHeadAttentionForward, MaskType
+    FMHA_AVAILABLE = True
+except ImportError:
+    FMHA_AVAILABLE = False
+
 from triton.testing import do_bench
 
 def time_fwd(func, *args, repeats=30, verbose=True, desc="", **kwargs):
@@ -217,6 +229,177 @@ def cudnn_spda_bwd_setup(q, k, v, o, g, lse, causal=False, window_size_left=None
     return run
 
 
+def fmha_setup(q, k, v, causal=False, is_persistent=True):
+    """Setup FMHA kernel for benchmarking.
+    
+    Args:
+        q: Query tensor of shape (batch, seqlen_q, nheads, headdim)
+        k: Key tensor of shape (batch, seqlen_k, nheads_kv, headdim)
+        v: Value tensor of shape (batch, seqlen_k, nheads_kv, headdim_v)
+        causal: Whether to use causal masking
+        is_persistent: Whether to use persistent kernel mode
+    
+    Returns:
+        A callable function that executes the FMHA kernel
+    """
+    if not FMHA_AVAILABLE:
+        return None
+    
+    # Check if we're on a compatible GPU (SM100/B100)
+    if torch.cuda.get_device_capability()[0] < 10:
+        return None
+    
+    b, s_q, h_q, d = q.shape
+    _, s_k, h_k, d_k = k.shape
+    _, _, _, d_v = v.shape
+    
+    # Check constraints
+    if d not in {32, 64, 128}:
+        return None
+    if h_q % h_k != 0:
+        return None
+    
+    # Convert PyTorch dtype to CUTE dtype
+    if q.dtype == torch.float16:
+        in_dtype = cutlass.Float16
+        out_dtype = cutlass.Float16
+    elif q.dtype == torch.bfloat16:
+        in_dtype = cutlass.BFloat16
+        out_dtype = cutlass.BFloat16
+    else:
+        return None
+    
+    qk_acc_dtype = Float32
+    pv_acc_dtype = Float32
+    
+    # Default MMA tiler for SM100
+    mma_tiler_mn = (128, 128)
+    mma_tiler = (*mma_tiler_mn, d)
+    
+    # Determine mask type
+    mask_type = MaskType.CAUSAL_MASK if causal else MaskType.NO_MASK
+    if not causal and s_k % mma_tiler_mn[1] != 0:
+        mask_type = MaskType.RESIDUAL_MASK
+    
+    # Create FMHA instance
+    fmha = BlackwellFusedMultiHeadAttentionForward(
+        qk_acc_dtype,
+        pv_acc_dtype,
+        mma_tiler,
+        is_persistent,
+        mask_type,
+    )
+    
+    # Convert PyTorch tensors to CUTE tensors
+    # FMHA expects layout with specific strides:
+    # Q: (s_q, d, ((h_r, h_k), b)) with stride (d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo))
+    # K: (s_k, d, ((h_r, h_k), b)) with stride (d * h_k, 1, ((0, d), stride_b_kv))
+    # V: (d_v, s_k, ((h_r, h_k), b)) with stride (1, d * h_k, ((0, d), stride_b_kv))
+    # O: (s_q, d_v, ((h_r, h_k), b)) with stride (d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo))
+    h_r = h_q // h_k
+    
+    # For Q: need (b, s_q, h_r, h_k, d) in memory, then view as (s_q, d, h_r, h_k, b)
+    # The stride for Q layout is: (d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo))
+    # where stride_b_qo = h_r * h_k * s_q * d
+    # So memory layout should be: (b, s_q, h_r, h_k, d) -> stride (s_q * h_r * h_k * d, h_r * h_k * d, h_k * d, d, 1)
+    # Then we view it as (s_q, d, h_r, h_k, b)
+    q_reshaped = q.view(b, s_q, h_r, h_k, d).permute(1, 4, 2, 3, 0).contiguous()
+    q_tensor = from_dlpack(q_reshaped, assumed_align=16)
+    q_tensor.element_type = in_dtype
+    
+    # For K: need to broadcast h_r, so we create (s_k, d, h_r, h_k, b) with h_r broadcasted (0-stride)
+    # Create base tensor and expand (without contiguous to preserve broadcasting)
+    k_base = k.view(b, s_k, h_k, d).permute(1, 3, 2, 0).contiguous()  # (s_k, d, h_k, b)
+    k_reshaped = k_base.unsqueeze(2).expand(s_k, d, h_r, h_k, b)  # Don't call contiguous() to preserve 0-stride
+    k_tensor = from_dlpack(k_reshaped, assumed_align=16)
+    k_tensor.element_type = in_dtype
+    
+    # For V: (d_v, s_k, h_r, h_k, b) with h_r broadcasted
+    v_base = v.view(b, s_k, h_k, d_v).permute(3, 1, 2, 0).contiguous()  # (d_v, s_k, h_k, b)
+    v_reshaped = v_base.unsqueeze(2).expand(d_v, s_k, h_r, h_k, b)  # Don't call contiguous() to preserve 0-stride
+    v_tensor = from_dlpack(v_reshaped, assumed_align=16)
+    v_tensor.element_type = in_dtype
+    
+    # Create output tensor: (s_q, d_v, h_r, h_k, b)
+    o_reshaped = torch.zeros(s_q, d_v, h_r, h_k, b, dtype=q.dtype, device=q.device)
+    o_tensor = from_dlpack(o_reshaped, assumed_align=16)
+    o_tensor.element_type = out_dtype
+    
+    # Setup problem size and scales
+    problem_size = (b, s_q, s_k, h_q, h_k, d)
+    scale_softmax = 1.0 / math.sqrt(d)
+    log2_e = math.log2(math.exp(1.0))
+    scale_softmax_log2 = scale_softmax * log2_e
+    scale_output = 1.0
+    
+    # Get stream
+    current_stream = cutlass_torch.default_stream()
+    
+    # Compile kernel
+    try:
+        compiled_fmha = cute.compile(
+            fmha,
+            q_tensor.iterator,
+            k_tensor.iterator,
+            v_tensor.iterator,
+            o_tensor.iterator,
+            problem_size,
+            None,  # cum_seqlen_q
+            None,  # cum_seqlen_k
+            scale_softmax_log2,
+            scale_output,
+            current_stream,
+        )
+    except Exception as e:
+        print(f"FMHA compilation failed: {e}")
+        return None
+    
+    # Store references to keep tensors alive
+    compiled_fmha._q_tensor = q_tensor
+    compiled_fmha._k_tensor = k_tensor
+    compiled_fmha._v_tensor = v_tensor
+    compiled_fmha._o_tensor = o_tensor
+    compiled_fmha._q_reshaped = q_reshaped
+    compiled_fmha._k_reshaped = k_reshaped
+    compiled_fmha._v_reshaped = v_reshaped
+    compiled_fmha._o_reshaped = o_reshaped
+    compiled_fmha._k_base = k_base
+    compiled_fmha._v_base = v_base
+    
+    def run(*args, **kwargs):
+        # Update input tensors
+        # Q: (b, s_q, h_q, d) -> (s_q, d, h_r, h_k, b)
+        q_new = q.view(b, s_q, h_r, h_k, d).permute(1, 4, 2, 3, 0).contiguous()
+        q_reshaped.copy_(q_new)
+        
+        # K: (b, s_k, h_k, d) -> (s_k, d, h_r, h_k, b) with h_r broadcasted
+        # Since expand creates views sharing the same base memory, update the base
+        k_new = k.view(b, s_k, h_k, d).permute(1, 3, 2, 0).contiguous()  # (s_k, d, h_k, b)
+        compiled_fmha._k_base.copy_(k_new)  # This updates all h_r slices since they're views
+        
+        # V: (b, s_k, h_k, d_v) -> (d_v, s_k, h_r, h_k, b) with h_r broadcasted
+        v_new = v.view(b, s_k, h_k, d_v).permute(3, 1, 2, 0).contiguous()  # (d_v, s_k, h_k, b)
+        compiled_fmha._v_base.copy_(v_new)  # This updates all h_r slices since they're views
+        
+        # Execute kernel
+        compiled_fmha(
+            q_tensor.iterator,
+            k_tensor.iterator,
+            v_tensor.iterator,
+            o_tensor.iterator,
+            problem_size,
+            None,
+            None,
+            scale_softmax_log2,
+            scale_output,
+            current_stream,
+        )
+        
+        return o_reshaped
+    
+    return run
+
+
 torch.manual_seed(0)
 repeats = 10
 dropout_p = 0.0
@@ -375,6 +558,20 @@ for headdim in [128]:
                     m1_py = time_fwd(flash_attn_func_python, q, k if page_size is None else k_paged, v_fa3 if page_size is None else v_paged, causal=causal, window_size=window_size, learnable_sink=sinks, softcap=softcap, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3 python')
                 else:
                     m1_py = time_fwd(flash_attn_varlen_func_python, q_unpad, k_unpad if page_size is None else k_paged, v_unpad if page_size is None else v_paged, cu_seqlens_q, cu_seqlens_k, page_table=page_table, causal=causal, window_size=window_size, softcap=softcap, pack_gqa=pack_gqa, repeats=repeats, verbose=verbose, desc='Fav3 python')
+            
+            # FMHA kernel benchmark
+            m_fmha = None
+            if FMHA_AVAILABLE and not varlen and headdim in {32, 64, 128} and dtype in {torch.float16, torch.bfloat16} and headdim == headdim_v:
+                try:
+                    time.sleep(1)
+                    fmha_func = fmha_setup(q, k, v, causal=causal, is_persistent=True)
+                    if fmha_func is not None:
+                        m_fmha = time_fwd(fmha_func, repeats=repeats, verbose=verbose, desc='FMHA')
+                        time_f[(causal, headdim, batch_size, seqlen), "FMHA"] = m_fmha.mean
+                except Exception as e:
+                    if verbose:
+                        print(f"FMHA benchmark failed: {e}")
+            
             if dtype != torch.float8_e4m3fn and headdim == headdim_v and flash_attn_func_v3 is not None and has_backward:
                 time.sleep(1)
                 if not varlen:
@@ -410,3 +607,6 @@ for headdim in [128]:
                 print(f'FA Python fwd: {m1_py.mean * 1e3:.3f}ms, {(nFLOPS / m1_py.mean * 1e-12):.1f} TFLOPS')
                 if dtype != torch.float8_e4m3fn and headdim == headdim_v and has_backward:
                     print(f'FA Python bwd: {m1b_py.mean * 1e3:.3f}ms, {(2.5 * nFLOPS / m1b_py.mean * 1e-12):.1f} TFLOPS')
+            
+            if m_fmha is not None:
+                print(f'FMHA fwd: {m_fmha.mean * 1e3:.3f}ms, {(nFLOPS / m_fmha.mean * 1e-12):.1f} TFLOPS')
