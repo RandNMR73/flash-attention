@@ -607,8 +607,8 @@ for headdim in [128]:
 
             if flash_attn_func_python is not None:
                 print(f'FA Python fwd: {m1_py.mean * 1e3:.3f}ms, {(nFLOPS / m1_py.mean * 1e-12):.1f} TFLOPS')
-                if dtype != torch.float8_e4m3fn and headdim == headdim_v and has_backward:
-                    print(f'FA Python bwd: {m1b_py.mean * 1e3:.3f}ms, {(2.5 * nFLOPS / m1b_py.mean * 1e-12):.1f} TFLOPS')
+                # if dtype != torch.float8_e4m3fn and headdim == headdim_v and has_backward:
+                #     print(f'FA Python bwd: {m1b_py.mean * 1e3:.3f}ms, {(2.5 * nFLOPS / m1b_py.mean * 1e-12):.1f} TFLOPS')
             
             if m_fmha is not None:
                 print(f'FMHA fwd: {m_fmha.mean * 1e3:.3f}ms, {(nFLOPS / m_fmha.mean * 1e-12):.1f} TFLOPS')
