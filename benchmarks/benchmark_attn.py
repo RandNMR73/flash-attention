@@ -303,19 +303,20 @@ def fmha_setup(q, k, v, causal=False, is_persistent=True):
     # where stride_b_qo = h_r * h_k * s_q * d
     # So memory layout should be: (b, s_q, h_r, h_k, d) -> stride (s_q * h_r * h_k * d, h_r * h_k * d, h_k * d, d, 1)
     # Then we view it as (s_q, d, h_r, h_k, b)
-    q_reshaped = q.view(b, s_q, h_r, h_k, d).permute(1, 4, 2, 3, 0).contiguous()
+    # Detach to avoid gradient issues when converting to CUTE tensors
+    q_reshaped = q.detach().view(b, s_q, h_r, h_k, d).permute(1, 4, 2, 3, 0).contiguous()
     q_tensor = from_dlpack(q_reshaped, assumed_align=16)
     q_tensor.element_type = in_dtype
     
     # For K: need to broadcast h_r, so we create (s_k, d, h_r, h_k, b) with h_r broadcasted (0-stride)
     # Create base tensor and expand (without contiguous to preserve broadcasting)
-    k_base = k.view(b, s_k, h_k, d).permute(1, 3, 2, 0).contiguous()  # (s_k, d, h_k, b)
+    k_base = k.detach().view(b, s_k, h_k, d).permute(1, 3, 2, 0).contiguous()  # (s_k, d, h_k, b)
     k_reshaped = k_base.unsqueeze(2).expand(s_k, d, h_r, h_k, b)  # Don't call contiguous() to preserve 0-stride
     k_tensor = from_dlpack(k_reshaped, assumed_align=16)
     k_tensor.element_type = in_dtype
     
     # For V: (d_v, s_k, h_r, h_k, b) with h_r broadcasted
-    v_base = v.view(b, s_k, h_k, d_v).permute(3, 1, 2, 0).contiguous()  # (d_v, s_k, h_k, b)
+    v_base = v.detach().view(b, s_k, h_k, d_v).permute(3, 1, 2, 0).contiguous()  # (d_v, s_k, h_k, b)
     v_reshaped = v_base.unsqueeze(2).expand(d_v, s_k, h_r, h_k, b)  # Don't call contiguous() to preserve 0-stride
     v_tensor = from_dlpack(v_reshaped, assumed_align=16)
     v_tensor.element_type = in_dtype
@@ -367,18 +368,18 @@ def fmha_setup(q, k, v, causal=False, is_persistent=True):
     compiled_fmha._v_base = v_base
     
     def run(*args, **kwargs):
-        # Update input tensors
+        # Update input tensors (detach to avoid gradient issues)
         # Q: (b, s_q, h_q, d) -> (s_q, d, h_r, h_k, b)
-        q_new = q.view(b, s_q, h_r, h_k, d).permute(1, 4, 2, 3, 0).contiguous()
+        q_new = q.detach().view(b, s_q, h_r, h_k, d).permute(1, 4, 2, 3, 0).contiguous()
         q_reshaped.copy_(q_new)
         
         # K: (b, s_k, h_k, d) -> (s_k, d, h_r, h_k, b) with h_r broadcasted
         # Since expand creates views sharing the same base memory, update the base
-        k_new = k.view(b, s_k, h_k, d).permute(1, 3, 2, 0).contiguous()  # (s_k, d, h_k, b)
+        k_new = k.detach().view(b, s_k, h_k, d).permute(1, 3, 2, 0).contiguous()  # (s_k, d, h_k, b)
         compiled_fmha._k_base.copy_(k_new)  # This updates all h_r slices since they're views
         
         # V: (b, s_k, h_k, d_v) -> (d_v, s_k, h_r, h_k, b) with h_r broadcasted
-        v_new = v.view(b, s_k, h_k, d_v).permute(3, 1, 2, 0).contiguous()  # (d_v, s_k, h_k, b)
+        v_new = v.detach().view(b, s_k, h_k, d_v).permute(3, 1, 2, 0).contiguous()  # (d_v, s_k, h_k, b)
         compiled_fmha._v_base.copy_(v_new)  # This updates all h_r slices since they're views
         
         # Execute kernel
