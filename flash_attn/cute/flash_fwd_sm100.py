@@ -851,7 +851,7 @@ class FlashAttentionForwardSm100:
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
         SeqlenInfoCls = partial(
-            SeqlenInfoQK,
+            SeqlenInfoQK.create,
             seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
             seqlen_k_static=mK.shape[0]
             if const_expr(mPageTable is None)
