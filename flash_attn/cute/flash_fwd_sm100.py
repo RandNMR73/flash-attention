@@ -528,7 +528,8 @@ class FlashAttentionForwardSm100:
             cute.size(mQ.shape[3])  # batch
             if const_expr(mCuSeqlensQ is None)
             else cute.size(mCuSeqlensQ.shape[0] - 1),  # num_sequences
-            cute.size(mK.shape[0])  # s_k
+            Int32(1),  # num_splits: SM100 doesn't support split KV, so always 1
+            cute.size(mK.shape[0])  # seqlen_k: s_k
             if const_expr(mPageTable is None)
             else mK.shape[0] * mPageTable.shape[1],  # num_pages * page_size
             mQ.shape[1],  # q head dim
