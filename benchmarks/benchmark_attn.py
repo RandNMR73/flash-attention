@@ -566,7 +566,10 @@ for headdim in [128]:
             if FMHA_AVAILABLE and not varlen and headdim in {32, 64, 128} and dtype in {torch.float16, torch.bfloat16} and headdim == headdim_v:
                 try:
                     time.sleep(1)
-                    fmha_func = fmha_setup(q, k, v, causal=causal, is_persistent=True)
+                    # Match the is_persistent logic from interface.py: persistent mode is disabled for causal
+                    # Since we're already checking not varlen, cu_seqlens_q is None and local is False (window_size is None)
+                    is_persistent = not causal
+                    fmha_func = fmha_setup(q, k, v, causal=causal, is_persistent=is_persistent)
                     if fmha_func is not None:
                         m_fmha = time_fwd(fmha_func, repeats=repeats, verbose=verbose, desc='FMHA')
                         time_f[(causal, headdim, batch_size, seqlen), "FMHA"] = m_fmha.mean
