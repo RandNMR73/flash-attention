@@ -450,7 +450,6 @@ def _flash_attn_fwd(
                 qhead_per_kvhead=qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
-                is_split_kv=is_split_kv,
                 pack_gqa=pack_gqa,
                 is_persistent=not causal
                 and not local
